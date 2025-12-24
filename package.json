@@ -1,19 +1,14 @@
 {
-  "name": "nodejs",
+  "name": "clean-match-bot",
   "version": "1.0.0",
-  "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "@supabase/supabase-js": "^2.89.0",
-    "@types/node": "^22.13.11",
-    "body-parser": "^2.2.1",
-    "express": "^5.2.1",
-    "twilio": "^5.11.1"
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "twilio": "^4.19.0",
+    "@supabase/supabase-js": "^2.38.4"
   }
 }
