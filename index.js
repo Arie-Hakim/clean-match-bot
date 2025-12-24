@@ -6,6 +6,7 @@ const { MessagingResponse } = require('twilio').twiml;
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
+// חיבור ל-Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 app.post('/whatsapp', async (req, res) => {
@@ -13,51 +14,70 @@ app.post('/whatsapp', async (req, res) => {
     const from = req.body.From;
     const twiml = new MessagingResponse();
 
-    console.log(`Received message from ${from}: ${incomingMsg}`); // לוג לצפייה ב-Render
+    console.log(`Message from ${from}: ${incomingMsg}`);
 
     try {
+        // 1. חיפוש המשתמש בטבלת profiles
         let { data: profile, error } = await supabase
             .from('profiles')
             .select('*')
             .eq('phone_number', from)
             .single();
 
-        // 1. משתמש חדש - שלב בחירת תפקיד
+        // 2. טיפול במשתמש חדש (בחירת תפקיד)
         if (!profile) {
             if (incomingMsg.includes('לקוח') || incomingMsg.includes('מנקה')) {
                 const role = incomingMsg.includes('לקוח') ? 'client' : 'cleaner';
-                const { error: insertError } = await supabase
-                    .from('profiles')
-                    .insert([{ phone_number: from, role: role }]);
-                
-                if (insertError) throw insertError;
+                await supabase.from('profiles').insert([{ phone_number: from, role: role }]);
                 twiml.message("נרשמת בהצלחה! 🎉\nעכשיו, איך קוראים לך? (שלח/י שם מלא)");
             } else {
                 twiml.message("ברוכים הבאים ל-CleanMatch! 🧹\nכדי להתחיל, כתוב/י האם את/ה *לקוח* או *מנקה*?");
             }
         } 
-        // 2. שלב איסוף השם
+        // 3. שלב איסוף השם
         else if (!profile.full_name) {
             await supabase.from('profiles').update({ full_name: incomingMsg }).eq('phone_number', from);
             twiml.message(`נעים מאוד ${incomingMsg}! 😊\nבאיזו עיר את/ה גר/ה?`);
         }
-        // 3. שלב איסוף העיר
+        // 4. שלב איסוף העיר
         else if (!profile.city) {
             await supabase.from('profiles').update({ city: incomingMsg }).eq('phone_number', from);
-            twiml.message("תודה! הרישום הסתיים. ✅\nבקרוב תוכל/י להתחיל להשתמש בשירות.");
+            twiml.message("תודה! הרישום הסתיים. ✅\nמה תרצה/י לעשות היום?\n\nכתוב/י *'ניקיון'* כדי למצוא עזרה.");
         }
-        // 4. משתמש רשום
+        // 5. לוגיקה למשתמש רשום - יצירת עבודה חדשה
         else {
-            twiml.message(`שלום ${profile.full_name}, איזה כיף לראות אותך! במה אוכל לעזור היום?`);
+            if (incomingMsg.includes('ניקיון')) {
+                // יצירת שורה חדשה בטבלת jobs
+                const { error: jobError } = await supabase
+                    .from('jobs')
+                    .insert([{ 
+                        client_phone: from, 
+                        city: profile.city, 
+                        status: 'pending' 
+                    }]);
+
+                if (jobError) throw jobError;
+
+                twiml.message(`קיבלתי! מחפש לך מנקה באזור ${profile.city}... 🔎\nאעדכן אותך ברגע שמישהו יתפנה.`);
+            } 
+            else if (incomingMsg.includes('סטטוס')) {
+                twiml.message("כרגע אין לנו עדכון על הזמנה פעילה. ברגע שיימצא מנקה, תקבל/י הודעה.");
+            }
+            else {
+                twiml.message(`שלום ${profile.full_name}, מה תרצה/י לעשות?\n\n1. כתוב/י *'ניקיון'* - למציאת מנקה.\n2. כתוב/י *'סטטוס'* - לבדיקת הזמנות.`);
+            }
         }
     } catch (err) {
-        console.error("Database Error:", err);
-        twiml.message("אופס, משהו השתבש. נסה שוב בעוד דקה.");
+        console.error("Error details:", err);
+        twiml.message("אופס, חלה שגיאה במערכת. נסה שוב מאוחר יותר.");
     }
 
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
 });
 
+// הגדרת הפורט עבור Render
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`CleanMatch server is running on port ${PORT}`);
+});
