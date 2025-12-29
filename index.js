@@ -5,6 +5,7 @@ const twilio = require('twilio');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(express.json());
 
