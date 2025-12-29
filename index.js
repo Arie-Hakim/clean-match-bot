@@ -2,154 +2,188 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
+app.use(express.json());
+
+// 🟢 אבטחה: Rate Limiting
+app.use('/whatsapp', rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+app.use('/cron', rateLimit({ windowMs: 60 * 1000, max: 10 }));
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// --- רשימת SIDs סופית ומאושרת ---
-const SIDS = {
-    CHOOSE_ROLE: 'HXcde09f46bc023aa95fd7bb0a705fa2dc',
-    CLIENT_CITY: 'HX232d288f7201dcedae6c483b80692b9d',
-    CLEANER_CITY: 'HXd9def526bc4c9013994cfe6a3b0d4898',
-    ADD_CITY_PROMPT: 'HX562db4f76686ae94f9827ba35d75a1cd',
-    CLIENT_MENU: 'HX3ae58035fa14b0f81c94e98093b582fa',
-    SELECT_DAY: 'HX69270232323e170ed106fd8e01395ed4', 
-    JOB_OFFER: 'HXef6e04eba99339e6a96a071cf7aa279b',  
-    APPROVE_CARD: 'HX7aa935f1701a55ddf2bce2cce57bd12b'
+// 🟢 אבטחה: אימות Twilio
+const validateTwilio = (req, res, next) => {
+    const signature = req.headers['x-twilio-signature'];
+    const url = (process.env.WEBHOOK_URL || '') + req.originalUrl;
+    if (process.env.NODE_ENV !== 'production' || twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, signature, url, req.body)) return next();
+    res.status(403).send('Forbidden');
 };
 
-// --- פונקציות עזר לוגיות ---
+const CONFIG = {
+    TWILIO_NUMBER: 'whatsapp:+14155238886',
+    CRON_SECRET: process.env.CRON_SECRET || 'secure-cron-key',
+    FIRST_BATCH_MINUTES: 2,
+    MAX_BIDS_LIMIT: 5,
+    TEMPLATES: {
+        CHOOSE_ROLE: 'HXcde09f46bc023aa95fd7bb0a705fa2dc',
+        CLIENT_CITY: 'HX232d288f7201dcedae6c483b80692b9d',
+        CLEANER_CITY: 'HXd9def526bc4c9013994cfe6a3b0d4898',
+        ADD_CITY: 'HX562db4f76686ae94f9827ba35d75a1cd',
+        CLIENT_MENU: 'HX3ae58035fa14b0f81c94e98093b582fa',
+        SELECT_DAY: 'HX69270232323e170ed106fd8e01395ed4',
+        JOB_OFFER: 'HXef6e04eba99339e6a96a071cf7aa279b'
+    },
+    DAYS: ["יום ראשון", "יום שני", "יום שלישי", "יום רביעי", "יום חמישי", "יום שישי", "מוצאי שבת"]
+};
 
-function getNextDateOfDay(dayName) {
-    const daysHebrew = ["יום ראשון", "יום שני", "יום שלישי", "יום רביעי", "יום חמישי", "יום שישי", "מוצאי שבת"];
-    const targetDay = daysHebrew.indexOf(dayName);
-    if (targetDay === -1) return null;
-    const now = new Date();
-    const resultDate = new Date();
-    resultDate.setDate(now.getDate() + (targetDay + 7 - now.getDay()) % 7);
-    return resultDate.toISOString().split('T')[0];
-}
+const STATES = { NEW: 'new', NAME: 'name', CITY: 'city', PRICING: 'pricing', BIO: 'bio', READY: 'ready', DAY: 'day', TIME: 'time', BID_PRICE: 'bid_price' };
 
-async function sendTemplate(to, contentSid, variables = {}) {
-    console.log(`[Twilio Log] שולח ${contentSid} ל-${to}. משתנים:`, variables);
-    try {
-        await client.messages.create({ from: 'whatsapp:+14155238886', to: to, contentSid: contentSid, contentVariables: JSON.stringify(variables) });
-    } catch (e) { console.error(`[Twilio Error] שגיאה בשליחה:`, e.message); }
-}
+// ==================== שירותי עזר (SERVICES) ====================
 
-app.post('/whatsapp', async (req, res) => {
-    const incomingMsg = req.body.Body ? req.body.Body.trim() : "";
-    const from = req.body.From;
+const Messaging = {
+    async sendMsg(to, body) {
+        console.log(`[Messaging] Text to ${to}`);
+        try { await twilioClient.messages.create({ from: CONFIG.TWILIO_NUMBER, to, body }); } catch (e) { console.error(e.message); }
+    },
+    async sendT(to, sid, vars = {}) {
+        console.log(`[Messaging] Template ${sid} to ${to}`);
+        try { await twilioClient.messages.create({ from: CONFIG.TWILIO_NUMBER, to, contentSid: sid, contentVariables: JSON.stringify(vars) }); } catch (e) { console.error(e.message); }
+    }
+};
 
-    console.log(`\n--- הודעה חדשה מ: ${from} | תוכן: "${incomingMsg}" ---`);
+const Auction = {
+    async closeAndNotify(jobId, clientPhone) {
+        const { data: bids } = await supabase.rpc('get_job_bids', { p_job_id: jobId });
+        if (!bids || bids.length === 0) {
+            await supabase.from('jobs').update({ status: 'cancelled' }).eq('id', jobId);
+            return Messaging.sendMsg(clientPhone, "😔 לא נמצאו מנקות פנויות לעבודה שלך.");
+        }
+        let msg = `מצאנו עבורך ${bids.length} הצעות! 🎉\n\n`;
+        bids.forEach((b, i) => msg += `${i + 1}️⃣ *${b.full_name}*\n⭐ ${b.rating} (${b.total_jobs})\n💰 הצעה: ${b.bid_price}\n📝 "${b.bio}"\n\n`);
+        msg += `לבחירה: שלח/י מספר (1-${bids.length})`;
+        await Messaging.sendMsg(clientPhone, msg);
+        await supabase.from('jobs').update({ status: 'awaiting_selection' }).eq('id', jobId);
+    }
+};
 
-    try {
-        let { data: profile } = await supabase.from('profiles').select('*').eq('phone_number', from).single();
+// ==================== מנהלי לוגיקה (HANDLERS) ====================
 
-        // 1. חשיפת פרטים הדדית לאחר אישור לקוחה (Privacy Flow)
-        if (profile?.role === 'client' && incomingMsg === 'approve_match') {
-            console.log(`[Flow] לקוחה אישרה מנקה. מחפש ג'וב ב-pending_approval.`);
-            const { data: job } = await supabase.from('jobs').select('*').eq('client_phone', from).eq('status', 'pending_approval').order('created_at', { ascending: false }).limit(1).single();
-            if (job) {
-                await supabase.from('jobs').update({ status: 'confirmed' }).eq('id', job.id);
-                const { data: cleaner } = await supabase.from('profiles').select('*').eq('phone_number', job.cleaner_phone).single();
-                const cleanCleaner = cleaner.phone_number.replace('whatsapp:', '');
-                const cleanClient = from.replace('whatsapp:', '');
+const Handlers = {
+    async cleaner(from, profile, msg) {
+        const jobId = profile.current_job_id;
+        // 1. הגשת מחיר (Input Validation)
+        if (profile.temp_state === STATES.BID_PRICE && jobId) {
+            if (!/\d/.test(msg)) return Messaging.sendMsg(from, "נא להזין מחיר ברור (למשל: 350 שח)");
+            const { data: r } = await supabase.rpc('submit_bid', { p_job_id: jobId, p_cleaner_phone: from, p_price: msg });
+            await supabase.from('profiles').update({ temp_state: null, current_job_id: null }).eq('phone_number', from);
+            if (!r[0].success) return Messaging.sendMsg(from, "המכרז נסגר 🙏");
+            await Messaging.sendMsg(from, "ההצעה נשלחה! נחזור אליך.");
+            if (r[0].bid_count === 1) await supabase.from('jobs').update({ bid_deadline: new Date(Date.now() + CONFIG.FIRST_BATCH_MINUTES * 60000).toISOString() }).eq('id', jobId);
+            if (r[0].bid_count >= CONFIG.MAX_BIDS_LIMIT) await Auction.closeAndNotify(jobId, (await supabase.from('jobs').select('client_phone').eq('id', jobId).single()).data.client_phone);
+            return true;
+        }
+        if (msg === 'job_accept' || msg === 'אני פנוי/ה') {
+            if (!jobId) return Messaging.sendMsg(from, "העבודה כבר לא זמינה.");
+            await supabase.from('profiles').update({ temp_state: STATES.BID_PRICE }).eq('phone_number', from);
+            await Messaging.sendMsg(from, "מה הצעת המחיר שלך?");
+            return true;
+        }
+        return false;
+    },
 
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: `סגרנו! 🎉 הטלפון של המנקה ${cleaner.full_name} הוא: ${cleanCleaner}\nתתחדשו! ✨` });
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: job.cleaner_phone, body: `הלקוחה אישרה! 🎉 הטלפון של ${profile.full_name} הוא: ${cleanClient}\nצרי קשר לתיאום.` });
-                return res.status(200).send('OK');
+    async client(from, profile, msg, draft) {
+        const { data: jobAwaiting } = await supabase.from('jobs').select('*').eq('client_phone', from).eq('status', 'awaiting_selection').single();
+        // 2. בחירת מנקה (Index Guard)
+        if (jobAwaiting && /^\d+$/.test(msg)) {
+            const choice = parseInt(msg);
+            const { data: bids } = await supabase.rpc('get_job_bids', { p_job_id: jobAwaiting.id });
+            const sel = bids?.[choice - 1];
+            if (!sel) return Messaging.sendMsg(from, `בחירה לא תקינה. נא לבחור בין 1 ל-${bids?.length || 0}`);
+            const { data: res } = await supabase.rpc('select_winner', { p_job_id: jobAwaiting.id, p_bid_id: sel.bid_id, p_client_phone: from });
+            if (res[0].success) {
+                await Messaging.sendMsg(from, `סגרנו! 🎉 טלפון של ${sel.full_name}: ${sel.cleaner_phone.replace('whatsapp:', '')}`);
+                await Messaging.sendMsg(sel.cleaner_phone, `הלקוחה בחרה בך! 🎉 צרי קשר: ${from.replace('whatsapp:', '')}`);
             }
+            return true;
         }
-
-        // 2. ריבוי ערים למנקה
-        if (profile?.role === 'cleaner' && incomingMsg === 'yes_another_city') {
-            await sendTemplate(from, SIDS.CLEANER_CITY);
-            return res.status(200).send('OK');
-        }
-
-        // 3. רישום פרופיל (שם, ערים, מחיר, נסיעות, ביו)
-        if (!profile) {
-            console.log(`[Registration] מתחיל רישום למספר ${from}`);
-            if (incomingMsg === 'לקוח' || incomingMsg === 'מנקה') {
-                await supabase.from('profiles').insert([{ phone_number: from, role: incomingMsg === 'לקוח' ? 'client' : 'cleaner' }]);
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "נעים מאוד! איך קוראים לך? (שם מלא)" });
-            } else { await sendTemplate(from, SIDS.CHOOSE_ROLE); }
-        } 
-        else if (!profile.full_name) {
-            await supabase.from('profiles').update({ full_name: incomingMsg }).eq('phone_number', from);
-            profile.role === 'client' ? await sendTemplate(from, SIDS.CLIENT_CITY) : await sendTemplate(from, SIDS.CLEANER_CITY);
-        }
-        else if (!profile.city || (profile.role === 'cleaner' && !profile.hourly_rate && (["כן", "לא", "yes_another_city", "no_more_cities"].includes(incomingMsg) || incomingMsg.length > 3))) {
-            const isCityInList = ["פתח תקווה", "תל אביב", "ראשון לציון", "רמת גן", "חולון", "בני ברק", "גבעתיים", "הרצליה", "רעננה", "הוד השרון", "כפר סבא"].includes(incomingMsg);
-            
-            if (isCityInList) {
-                const currentCities = profile.city ? `${profile.city}, ${incomingMsg}` : incomingMsg;
-                await supabase.from('profiles').update({ city: currentCities }).eq('phone_number', from);
-                profile.role === 'cleaner' ? await sendTemplate(from, SIDS.ADD_CITY_PROMPT) : await sendTemplate(from, SIDS.CLIENT_MENU);
-            } else if (incomingMsg === 'no_more_cities') {
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "מה המחיר לשעה שלך בשקלים? (מספר בלבד)" });
+        // 3. הפצת עבודה (Promise.all - Performance)
+        if (draft && !draft.job_time && msg.length > 2) {
+            await supabase.from('jobs').update({ job_time: msg, status: 'pending' }).eq('id', draft.id);
+            const { data: clns } = await supabase.from('profiles').select('phone_number, city').eq('role', 'cleaner');
+            const matched = clns.filter(c => c.city?.includes(draft.city)).map(c => c.phone_number);
+            if (matched.length > 0) {
+                await supabase.from('profiles').update({ current_job_id: draft.id }).in('phone_number', matched);
+                await Promise.all(matched.map(p => Messaging.sendT(p, CONFIG.TEMPLATES.JOB_OFFER, { "1": draft.city, "2": msg })));
             }
+            await Messaging.sendMsg(from, "מחפשת מנקות... נחזור אליך עם הצעות.");
+            return true;
         }
-        // השלמת רישום מנקה (מחיר -> נסיעות -> ביו)
-        else if (profile.role === 'cleaner' && !profile.hourly_rate) {
-            await supabase.from('profiles').update({ hourly_rate: parseInt(incomingMsg) }).eq('phone_number', from);
-            await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "דמי נסיעות? (0 אם כלול במחיר)" });
-        }
-        else if (profile.role === 'cleaner' && profile.travel_fee === null) {
-            await supabase.from('profiles').update({ travel_fee: parseInt(incomingMsg) }).eq('phone_number', from);
-            await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "ספר/י על עצמך במשפט אחד (ניסיון וכו'):" });
-        }
-        else if (profile.role === 'cleaner' && !profile.bio) {
-            await supabase.from('profiles').update({ bio: incomingMsg }).eq('phone_number', from);
-            await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "הפרופיל מוכן! נעדכן אותך כשתהיה עבודה. ✨" });
-        }
+        return false;
+    }
+};
 
-        // 4. לוגיקת שידוך עם מועד (Draft -> Date -> Time -> Pending)
-        else if (profile.role === 'client') {
-            const { data: draftJob } = await supabase.from('jobs').select('*').eq('client_phone', from).eq('status', 'draft').single();
+// ==================== ENDPOINTS (WEBHOOK & CRON) ====================
 
-            if (incomingMsg.includes('תיאום')) {
-                console.log(`[Flow] לקוחה התחילה תיאום.`);
-                await supabase.from('jobs').insert([{ client_phone: from, city: profile.city, status: 'draft' }]);
-                await sendTemplate(from, SIDS.SELECT_DAY); 
-            }
-            else if (draftJob && !draftJob.job_date) {
-                const absDate = getNextDateOfDay(incomingMsg);
-                await supabase.from('jobs').update({ job_date: absDate }).eq('id', draftJob.id);
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: `נקבע ל${incomingMsg} (${absDate.split('-').reverse().join('/')}). באיזו שעה נוח לך?` });
-            }
-            else if (draftJob && draftJob.job_date && !draftJob.job_time) {
-                console.log(`[Flow] ג'וב הושלם. מפיץ למנקות ב-${profile.city}.`);
-                await supabase.from('jobs').update({ job_time: incomingMsg, status: 'pending' }).eq('id', draftJob.id);
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "🔎 מחפש עבורך מנקה... אעדכן אותך מיד." });
-
-                const { data: cleaners } = await supabase.from('profiles').select('*').eq('role', 'cleaner');
-                const matches = cleaners.filter(c => c.city && c.city.includes(profile.city));
-                const dateStr = draftJob.job_date.split('-').reverse().join('/');
-                matches.forEach(c => sendTemplate(c.phone_number, SIDS.JOB_OFFER, { "1": profile.city, "2": `${dateStr} בשעה ${incomingMsg}` }));
-            }
-        }
-        
-        // 5. מנקה מאשרת פניות (Matching Logic)
-        else if (profile.role === 'cleaner' && (incomingMsg === 'job_accept' || incomingMsg.includes('פנוי'))) {
-            const { data: jobs } = await supabase.from('jobs').select('*').eq('status', 'pending');
-            // מציאת ג'וב שמתאים לעיר של המנקה
-            const matchingJob = jobs.find(j => profile.city.includes(j.city));
-            
-            if (matchingJob) {
-                console.log(`[Match] מנקה ${from} תואמה לג'וב ${matchingJob.id}`);
-                await supabase.from('jobs').update({ cleaner_phone: from, status: 'pending_approval' }).eq('id', matchingJob.id);
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "הפרופיל נשלח ללקוחה. מחכים לאישורה! ⏳" });
-                await sendTemplate(matchingJob.client_phone, SIDS.APPROVE_CARD, { "1": profile.full_name, "2": profile.hourly_rate.toString(), "3": profile.travel_fee.toString(), "4": profile.bio });
-            }
-        }
-    } catch (err) { console.error(`[CRITICAL ERROR]`, err); }
-    res.status(200).send('OK');
+app.get('/cron/cleanup', async (req, res) => {
+    if (req.headers['x-cron-secret'] !== CONFIG.CRON_SECRET) return res.status(403).send('Forbidden');
+    const { data: expired } = await supabase.from('jobs').select('*').eq('status', 'collecting_bids').lt('bid_deadline', new Date().toISOString());
+    if (expired) for (const j of expired) await Auction.closeAndNotify(j.id, j.client_phone);
+    res.status(200).send({ processed: expired?.length || 0 });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`CleanMatch 3.9 Live & Logging`));
+app.post('/whatsapp', validateTwilio, async (req, res) => {
+    const msg = (req.body.Body || "").trim();
+    const from = req.body.From;
+    try {
+        const { data: profile } = await supabase.from('profiles').select('*').eq('phone_number', from).single();
+        let handled = false;
+        if (profile?.role === 'cleaner') handled = await Handlers.cleaner(from, profile, msg);
+        if (!handled && profile?.role === 'client') {
+            const { data: drft } = await supabase.from('jobs').select('*').eq('client_phone', from).eq('status', 'draft').single();
+            handled = await Handlers.client(from, profile, msg, drft);
+        }
+        if (handled) return res.status(200).send('OK');
+
+        // State Machine - Registration
+        let state = !profile ? STATES.NEW : !profile.full_name ? STATES.NAME : !profile.city ? STATES.CITY : STATES.READY;
+        if (profile?.role === 'client' && state === STATES.READY) {
+            const { data: drft } = await supabase.from('jobs').select('*').eq('client_phone', from).eq('status', 'draft').single();
+            if (drft) state = !drft.job_date ? STATES.DAY : STATES.TIME;
+        }
+
+        switch (state) {
+            case STATES.NEW:
+                if (msg === 'לקוח' || msg === 'מנקה') {
+                    await supabase.from('profiles').insert([{ phone_number: from, role: msg === 'לקוח' ? 'client' : 'cleaner' }]);
+                    await Messaging.sendMsg(from, "ברוכים הבאים! איך קוראים לך?");
+                } else await Messaging.sendT(from, CONFIG.TEMPLATES.CHOOSE_ROLE);
+                break;
+            case STATES.CITY:
+                const c = profile.city ? `${profile.city}, ${msg}` : msg;
+                await supabase.from('profiles').update({ city: c }).eq('phone_number', from); // תיקון phone_number
+                await Messaging.sendT(from, profile.role === 'cleaner' ? CONFIG.TEMPLATES.ADD_CITY : CONFIG.TEMPLATES.CLIENT_MENU);
+                break;
+            case STATES.READY:
+                if (msg.includes('תיאום')) {
+                    await supabase.from('jobs').insert([{ client_phone: from, city: profile.city, status: 'draft' }]);
+                    await Messaging.sendT(from, CONFIG.TEMPLATES.SELECT_DAY);
+                }
+                break;
+        }
+        res.status(200).send('OK');
+    } catch (e) { console.error(e); res.status(200).send('OK'); }
+});
+
+function getNextDate(dayName) {
+    const target = CONFIG.DAYS.indexOf(dayName);
+    if (target === -1) return null;
+    const d = new Date();
+    d.setDate(d.getDate() + (target + 7 - d.getDay()) % 7);
+    return d.toISOString().split('T')[0];
+}
+
+app.listen(process.env.PORT || 3000, () => console.log('🚀 CleanMatch Ultimate 13.0 Live'));
