@@ -29,7 +29,7 @@ app.post('/whatsapp', async (req, res) => {
     try {
         let { data: profile } = await supabase.from('profiles').select('*').eq('phone_number', from).single();
 
-        // 1. בדיקת שלב ביקורת (אם הלקוח משאיר משפטים)
+        // 1. בדיקת שלב ביקורת (לקוח משאיר משפטים)
         const { data: openReview } = await supabase.from('reviews')
             .select('*').eq('client_phone', from).is('comment', null).order('created_at', { ascending: false }).limit(1).single();
 
@@ -43,7 +43,7 @@ app.post('/whatsapp', async (req, res) => {
         if (!profile) {
             if (incomingMsg === 'לקוח' || incomingMsg === 'מנקה') {
                 await supabase.from('profiles').insert([{ phone_number: from, role: incomingMsg === 'לקוח' ? 'client' : 'cleaner' }]);
-                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "ברוך הבא! 🎉 איך קוראים לך? (שם מלא)" });
+                await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "נרשמת! איך קוראים לך? (שם מלא)" });
             } else {
                 await sendTemplate(from, 'HXcde09f46bc023aa95fd7bb0a705fa2dc');
             }
@@ -75,9 +75,9 @@ app.post('/whatsapp', async (req, res) => {
             await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "הפרופיל מוכן! ✨" });
         }
 
-        // 4. משתמשים רשומים - הלוגיקה המרכזית
+        // 4. לוגיקת הקישור (Matching Logic)
         else {
-            // לקוח מבקש מנקה (תומך גם ב"תיאום מנקה" מהצילום מסך)
+            // א. לקוח מבקש מנקה
             if (profile.role === 'client' && (incomingMsg.includes('ניקיון') || incomingMsg.includes('תיאום'))) {
                 await supabase.from('jobs').insert([{ client_phone: from, city: profile.city, status: 'pending' }]);
                 await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: `🔎 מחפש מנקה ב${profile.city}...` });
@@ -87,34 +87,36 @@ app.post('/whatsapp', async (req, res) => {
                     cleaners.forEach(c => sendTemplate(c.phone_number, 'HXd2f1d5fe4e58f73b4edb85b2450fc1dc', { "1": profile.city }));
                 }
             }
-            // מנקה מאשרת עבודה
-            else if (profile.role === 'cleaner' && incomingMsg === 'job_accept') {
+            // ב. מנקה מאשרת עבודה (התיקון כאן!)
+            else if (profile.role === 'cleaner' && (incomingMsg === 'job_accept' || incomingMsg.includes('פנוי'))) {
                 const { data: job } = await supabase.from('jobs').select('*').eq('city', profile.city).eq('status', 'pending').order('created_at', { ascending: false }).limit(1).single();
                 if (job) {
                     await supabase.from('jobs').update({ cleaner_phone: from, status: 'confirmed' }).eq('id', job.id);
                     await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: `העבודה שלך! 📞 לקוח: ${job.client_phone}` });
                     
-                    const card = `⭐ נמצאה מנקה! ⭐\nשם: ${profile.full_name}\nמחיר: ${profile.hourly_rate}₪ + ${profile.travel_fee}₪ נסיעות\nתיאור: ${profile.bio}`;
+                    const card = `⭐ נמצאה מנקה! ⭐\n\nשם: ${profile.full_name}\nמחיר: ${profile.hourly_rate}₪ + ${profile.travel_fee}₪ נסיעות\n\nתיאור: ${profile.bio}`;
                     await client.messages.create({ from: 'whatsapp:+14155238886', to: job.client_phone, body: card });
+                } else {
+                    await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "מישהו כבר הקדים אותך לעבודה הזו. נעדכן בפעם הבאה! 🧹" });
                 }
             }
-            // מנקה מסמנת סיום
-            else if (profile.role === 'cleaner' && incomingMsg.includes('סיימתי')) {
+            // ג. מנקה מסמנת סיום
+            else if (profile.role === 'cleaner' && (incomingMsg.includes('סיימתי') || incomingMsg.includes('סיום'))) {
                 const { data: job } = await supabase.from('jobs').select('*').eq('cleaner_phone', from).eq('status', 'confirmed').single();
                 if (job) {
                     await supabase.from('jobs').update({ status: 'completed' }).eq('id', job.id);
-                    await client.messages.create({ from: 'whatsapp:+14155238886', to: job.client_phone, body: "הניקיון הסתיים! דרג/י 1-5:" });
+                    await client.messages.create({ from: 'whatsapp:+14155238886', to: job.client_phone, body: "הניקיון הסתיים! ✨ איך היה? דרג/י 1-5:" });
                 }
             }
-            // לקוח מדרג
+            // ד. לקוח מדרג
             else if (profile.role === 'client' && !isNaN(incomingMsg) && incomingMsg >= 1 && incomingMsg <= 5) {
                 const { data: job } = await supabase.from('jobs').select('*').eq('client_phone', from).eq('status', 'completed').order('created_at', { ascending: false }).limit(1).single();
                 if (job) {
                     await supabase.from('reviews').insert([{ job_id: job.id, cleaner_phone: job.cleaner_phone, client_phone: from, rating: parseInt(incomingMsg) }]);
-                    await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "תודה! עכשיו כתוב/י כמה משפטים על השירות:" });
+                    await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "תודה! עכשיו כתוב/י בכמה משפטים מה חשבת על המנקה:" });
                 }
             }
-            // תפריט ברירת מחדל
+            // ה. תפריט ברירת מחדל
             else {
                 if (profile.role === 'client') await sendTemplate(from, 'HX3ae58035fa14b0f81c94e98093b582fa');
                 else await client.messages.create({ from: 'whatsapp:+14155238886', to: from, body: "ממתינים לעבודות... 🧹" });
