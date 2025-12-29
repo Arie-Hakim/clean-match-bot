@@ -18,9 +18,19 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 
 // 🟢 אבטחה: אימות Twilio
 const validateTwilio = (req, res, next) => {
+    console.log("--- בדיקת הודעה נכנסת ---");
     const signature = req.headers['x-twilio-signature'];
     const url = (process.env.WEBHOOK_URL || '') + req.originalUrl;
-    if (process.env.NODE_ENV !== 'production' || twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, signature, url, req.body)) return next();
+    
+    console.log("URL שנבדק:", url);
+    console.log("חתימה שהתקבלה:", signature ? "קיימת" : "חסרה!");
+
+    if (process.env.NODE_ENV !== 'production' || twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, signature, url, req.body)) {
+        console.log("✅ אימות הצליח!");
+        return next();
+    }
+    
+    console.error('❌ אימות נכשל! בדוק ש-WEBHOOK_URL ו-TWILIO_AUTH_TOKEN מוגדרים נכון ברנדר.');
     res.status(403).send('Forbidden');
 };
 
